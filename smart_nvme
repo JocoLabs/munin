@@ -1,0 +1,217 @@
+#!/usr/bin/php
+<?php
+/*
+
+Plugin: Monitors S.M.A.R.T. statistics on NVMe drives
+Author: Joe Tolan
+
+Licence: Creative Commons - Attribution-ShareAlike 3.0 Unported (CC BY-SA 3.0)
+http://creativecommons.org/licenses/by-sa/3.0/
+
+### Usage
+Use as is to get graphs for each installed nvme.
+Go wildcard style to target a single device
+Use the config to exclude devices (separated by a space)
+Graphs named using serial number to avoid device name changes on reboot
+
+### Config
+[smart_nvme*]
+  user root
+  env.exclude nvme1
+
+### Version history
+  1.0 initial release
+
+##############################
+Magic markers
+#%# capabilities=autoconf
+#%# family=auto
+*/
+
+$basename = preg_replace( '/^.+[\\\\\\/]/', '', $_SERVER['PHP_SELF'] );
+$parts_name = explode("_", $basename);
+$device = array_pop($parts_name);
+$is_debug = $_SERVER["MUNIN_DEBUG"] == 1;
+
+$devices = [];
+
+if ( $device != '' ) {
+    foreach (["/dev/", "/dev/disk/by-id/"] as $dev ) {
+        if ( is_file($dev . $device ) )
+            $devices[] = $dev . $device;
+    }
+}
+
+// make sure that path to nvme is valid for your system
+$cmd_scan = '/sbin/smartctl -j -d nvme --scan';
+$cmd_stats = '/sbin/smartctl -a -j ';
+
+if ( empty($devices) ) {
+    $out_cmd_scan = shell_exec($cmd_scan);
+    $json_scan = json_decode($out_cmd_scan, true);
+    if ( json_last_error() !== JSON_ERROR_NONE ) {
+        //do something
+        $json_scan = [
+            "smartctl" => [
+                "exit_status" => 1
+                , "messages" => [
+                    [ "severity" => 'error', "string" => 'error running command']
+                ]
+            ]
+        ];
+    }
+
+    $exit_code = $json_scan["smartctl"]["exit_status"];
+    if ( $exit_code != 0 ) {
+        $messages = '';
+        foreach ($json_scan["smartctl"]["messages"] as $msg ) {
+            $messages .= $msg["severity"] . ': ' . $msg["string"] . "\n";
+        }
+        die($messages);
+    }
+    foreach ( $json_scan["devices"] as $device ) {
+        $devices[] = $device["name"];
+    }
+}
+
+$data_labels = [
+    "smart_status" => [
+        "label" => 'S.M.A.R.T error'
+        , "critical" => 1
+    ]
+    , 'percentage_used' => [
+        "label" => 'Wear out %'
+        , "warning" => 90
+        , "critical" => 95
+    ]
+    , 'power_on_hours' => [
+        "label" => 'Days.hours online'
+    ]
+    , 'power_cycles' => [
+        "label" => 'Power cycles'
+    ]
+    , 'unsafe_shutdowns' => [
+        "label" => 'Unsafe shutdowns'
+    ]
+    , 'temperature' => [
+        "label" => 'Temperature C'
+    ]
+    , 'media_errors' => [
+        "label" => 'Media and data integrity errors #'
+    ]
+    , 'warning_temp_time' => [
+        "label" => 'Mins past warning temp'
+    ]
+    , 'critical_comp_time' => [
+        "label" => 'Mins past critical temp'
+    ]
+];
+
+$data_points = [
+    "smart_status" => 0
+    , 'percentage_used' => 0
+    , 'power_on_hours' => 0
+    , 'power_cycles' => 0
+    , 'unsafe_shutdowns' => 0
+    , 'temperature' => 0
+    , 'media_errors' => 0
+    , 'warning_temp_time' => 0
+    , 'critical_comp_time' => 0
+];
+
+if ( in_array('autoconf', $argv) ) {
+    echo empty($devices) ? 'no (no nvme found)' : 'yes';
+    exit;
+}
+
+$is_config = in_array('config', $argv);
+$env_exclude = getenv('exclude');
+$list_excludes = [];
+if ( $env_exclude !== false ) {
+    $list_excludes = explode(' ', $env_exclude);
+}
+
+
+foreach ($devices as $device ) {
+    $parts_device = explode('/', $device);
+    $name_device = array_pop($parts_device);
+    if ( in_array($name_device, $list_excludes) || in_array($device, $list_excludes) )
+        continue;
+
+
+    $cmd_stats_drive = $cmd_stats . $device;
+    $out_cmd = shell_exec($cmd_stats_drive);
+    $json = json_decode($out_cmd, true);
+    if (json_last_error() !== JSON_ERROR_NONE) {
+        continue;
+    }
+
+    $exit_code = $json["smartctl"]["exit_status"];
+    if ( $exit_code != 0 ) {
+        $messages = '';
+        foreach ($json["smartctl"]["messages"] as $msg ) {
+            $messages .= $msg["severity"] . ': ' . $msg["string"] . "\n";
+        }
+        //die($messages);
+        continue;
+    }
+
+    $model_name = $json["model_name"];
+    $serial_number = $json["serial_number"];
+
+    $stats = $json["nvme_smart_health_information_log"];
+    $stats["smart_status"] = $json["smart_status"]["passed"] == 1 ? 0 : 1;
+
+    foreach ($json["nvme_namespaces"] as $ns ) {
+        $data_labels["ns".$ns["id"]] = [
+            "label" => 'NS ' . $ns["id"] . ' usage %'
+            , "warning" => 95
+            , "critical" => 98
+        ];
+
+        $data_points["ns".$ns["id"]] = 0;
+    }
+
+    if ($is_config) {
+        $out = "multigraph smart_nvme_" . $serial_number . "\n";
+        $out .= "graph_title S.M.A.R.T - " . $device . "\n";
+        $out .= "graph_vlabel Stat\n";
+        $out .= "graph_category disk\n";
+        $out .= 'graph_args --base 1000 -l 0' . "\n";
+        $out .= 'graph_info This graph shows S.M.A.R.T for ' . $model_name . ' (' . $device .')' . "\n";
+        foreach ($data_labels as $stat => $attrs ) {
+            foreach ($attrs as $attr => $attr_val ) {
+                $out .= $stat . "." . $attr . " " . $attr_val . "\n";
+            }
+        }
+
+        echo $out . "\n";
+        continue;
+    }
+
+    foreach ($json["nvme_namespaces"] as $ns ) {
+        $usage = round(($ns["utilization"]["bytes"] / $ns["capacity"]["bytes"]) * 100, 2);
+        $stats["ns".$ns["id"]] = $usage;
+    }
+
+
+    foreach ($data_points as $stat => $value) {
+        if (key_exists($stat, $stats)) {
+            $val = $stats[$stat];
+            // Used to calc from kelvin
+            //if ($stat == 'temperature') $val = $val - 273.15;
+
+            if ($stat == 'power_on_hours') {
+                $val = floor($val / 24);
+                $val .= '.' . ($stats[$stat] - $val * 24);
+            }
+
+            //if ( $stat == 'controller_busy_time' ) {}
+
+            $data_points[$stat] = $val;
+        }
+    }
+
+    echo "multigraph smart_nvme_" . $serial_number . "\n";
+    foreach ($data_points as $stat => $value) echo "$stat.value $value\n";
+}
